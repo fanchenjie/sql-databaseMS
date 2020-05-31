@@ -4,6 +4,7 @@
  * @see "Seattle University, CPSC5300, Spring 2020"
  */
 #include "SQLExec.h"
+#include "EvalPlan.h"
 
 using namespace std;
 using namespace hsql;
@@ -89,11 +90,155 @@ QueryResult *SQLExec::execute(const SQLStatement *statement) {
 }
 
 QueryResult *SQLExec::insert(const InsertStatement *statement) {
-    return new QueryResult("INSERT statement not yet implemented");  // FIXME
+    // return new QueryResult("INSERT statement not yet implemented");  // FIXME
+    Identifier table_name = statement->tableName;
+    DbRelation &table = SQLExec::tables->get_table(table_name);
+    ColumnNames column_names;
+    
+    if (statement->columns != NULL) {
+		for (char* column : *statement->columns) {
+			column_names.push_back(column);
+		}
+	}
+	else {
+		column_names = table.get_column_names();
+	}
+
+	vector<Value> records;
+	for (auto const record : *statement->values) {
+		switch (record->type) {
+		case kExprLiteralString:
+			records.push_back(Value(record->name));
+			break;
+		case kExprLiteralInt:
+			records.push_back(Value(record->ival));
+			break;
+		default:
+			throw DbRelationError("Unsupported Data type!");
+		}
+	}
+
+
+    uint size;
+	// hold handle for inserting row 
+	Handle record_handle;
+	try {
+		
+		ValueDict row;
+		Identifier column_name;
+		for (u_int16_t i = 0; i < column_names.size(); i++) {
+			column_name = column_names.at(i);
+			row[column_name] = records.at(i);
+		}
+		// insert row to table
+		record_handle = table.insert(&row);
+
+		// update index
+		IndexNames index_names = SQLExec::indices->get_index_names(table_name);
+		size = index_names.size();
+		try {
+			for (u_int16_t i = 0; i < index_names.size(); i++) {
+				DbIndex &index = SQLExec::indices->get_index(table_name, index_names[i]);
+				index.insert(record_handle);
+			}
+		}
+		catch (exception& e) {
+			for (u_int16_t i = 0; i < index_names.size(); i++) {
+				DbIndex &index = SQLExec::indices->get_index(table_name, index_names[i]);
+				index.del(record_handle);
+			}
+		}
+	}
+	catch (exception& e) {
+		try {
+			table.del(record_handle);
+		}
+		catch (...) {}
+		throw;
+	}
+
+    
+    return new QueryResult("successfully inserted 1 row into " + table_name + " and " + to_string(size) + " indices");
+}
+
+ValueDict *SQLExec::get_where_conjunction(const Expr *where_clause) {
+	// to hold rows
+	ValueDict* rows = new ValueDict();
+	// validate where clause type
+	if (where_clause->type == kExprOperator) {
+		// for now, we only accept AND for complicated where condition
+		if (where_clause->opType == Expr::AND) {
+			// recursively invoke for Expr
+			ValueDict* sub_row = get_where_conjunction(where_clause->expr);
+			rows->insert(sub_row->begin(), sub_row->end());
+			sub_row = get_where_conjunction(where_clause->expr2);
+			rows->insert(sub_row->begin(), sub_row->end());
+			// in case of simple operator
+		}
+		else if (where_clause->opType == Expr::SIMPLE_OP) {
+			Identifier column_name = where_clause->expr->name;
+			Value value;
+			// for now, only INT or STRING
+			switch (where_clause->expr2->type) {
+			case kExprLiteralString:
+				value = Value(where_clause->expr2->name);
+				break;
+			case kExprLiteralInt:
+				value = Value(where_clause->expr2->ival);
+				break;
+			default:
+				throw DbRelationError("Unrecognized value!");
+				break;
+			}
+			(*rows)[column_name] = value;
+		}
+		else
+			throw DbRelationError("Unsupport opType!");
+	}
+	else
+		throw DbRelationError("Unsupport type!");
+	return rows;
 }
 
 QueryResult *SQLExec::del(const DeleteStatement *statement) {
-    return new QueryResult("DELETE statement not yet implemented");  // FIXME
+    // return new QueryResult("DELETE statement not yet implemented");  // FIXME
+    Identifier table_name = statement->tableName;
+    DbRelation &table = SQLExec::tables->get_table(table_name);
+    
+    //start base of plan at a TableScan
+    EvalPlan *plan = new EvalPlan(table);
+    //enclose that in a delete if we have a where clause
+    if(statement->expr != nullptr)
+        plan = new EvalPlan(get_where_conjunction(statement->expr), plan);
+    //optimize the plan
+    EvalPlan *optimized = plan->optimize();
+    EvalPipeline pipeline = optimized->pipeline();
+
+    // now delete all the handles
+    IndexNames index_names = SQLExec::indices->get_index_names(table_name);
+	// to hold hanles from piepleline
+	Handles *handles = pipeline.second;
+	// iterate to delete index from index table
+	for (auto const &index_name : index_names) {
+		DbIndex& index = SQLExec::indices->get_index(table_name, index_name);
+		for (auto const &handle : *handles) {
+			index.del(handle);
+		}
+	}
+	// to hold suffix string statement for query result
+	string suffix;
+	// in case of no index deletion
+	if (index_names.size() == 0)
+		suffix = "";
+	// in case of index/indices is/are deleted
+	else
+		suffix = " and from " + to_string(index_names.size()) + " indices";
+	// delete from table
+	for (auto const &handle : *handles) {
+		pipeline.first->del(handle);
+	}
+
+	return new QueryResult("successfully deleted " + to_string(handles->size()) + " rows from " + table_name + suffix);
 }
 
 QueryResult *SQLExec::select(const SelectStatement *statement) {
